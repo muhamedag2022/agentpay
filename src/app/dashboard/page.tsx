@@ -6,13 +6,16 @@ import { useRouter } from 'next/navigation';
 import { useEffect, useState, useRef } from 'react';
 import { useAgentStore } from '@/store/agentStore';
 import { Agent } from '@/types';
-import { Bot, Plus, Zap, Shield, Activity, Wallet, ChevronRight, Play, Pause, Trash2, CheckCircle } from 'lucide-react';
-import { shortenAddress, explorerUrl, connection } from '@/lib/solana';
+import { Bot, Plus, Zap, Shield, Activity, Wallet, ChevronRight, Play, Pause, Trash2, CheckCircle, Key, Globe } from 'lucide-react';
+import { shortenAddress, explorerUrl } from '@/lib/solana';
 import { executeAgentTask } from '@/lib/executeTask';
 import { mintAgentNFT } from '@/lib/mintNFT';
 import { executeWithSessionKey, restoreSessionKey } from '@/lib/sessionExecutor';
 import { getStoredSessionKey } from '@/store/agentStore';
-import { Keypair } from '@solana/web3.js';
+import { registerAgentInAgentBook, createVerifiedAgentClient } from '@/lib/worldIdAgent';
+import { Keypair, Connection } from '@solana/web3.js';
+import { IDKitRequestWidget, orbLegacy, type RpContext } from '@worldcoin/idkit';
+import type { IDKitResult } from '@worldcoin/idkit';
 
 export default function DashboardPage() {
   const { connected, publicKey } = useWallet();
@@ -126,7 +129,7 @@ function WelcomePanel({ onCreate }: { onCreate: () => void }) {
       <div>
         <h2 style={{ fontSize: '1.8rem', fontWeight: 700, marginBottom: '0.5rem' }}>Deploy Your First Agent</h2>
         <p style={{ color: 'var(--text-secondary)', maxWidth: '400px' }}>
-          Create an AI agent that executes tasks and makes payments on Solana on your behalf.
+          Create an AI agent that executes tasks and makes USDC payments on Solana on your behalf.
         </p>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '1rem', maxWidth: '600px' }}>
@@ -151,36 +154,87 @@ function WelcomePanel({ onCreate }: { onCreate: () => void }) {
 
 function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
   const { updateAgentStatus, removeAgent, selectAgent, addLog, updateAgentSpent, updateAgentVerified, setSessionKey } = useAgentStore();
-  const { signTransaction } = useWallet();
+  const { signTransaction, wallet } = useWallet();
   const { connection } = useConnection();
   const [isExecuting, setIsExecuting] = useState(false);
   const [autoRunning, setAutoRunning] = useState(false);
-  const [showWorldIDModal, setShowWorldIDModal] = useState(false);
+  const [worldIdOpen, setWorldIdOpen] = useState(false);
+  const [rpContext, setRpContext] = useState<RpContext | null>(null);
   const [sessionKeyReady, setSessionKeyReady] = useState(false);
   const [fundingSession, setFundingSession] = useState(false);
+  const [sessionBalance, setSessionBalance] = useState<number | null>(null);
+  const [sessionAddress, setSessionAddress] = useState<string>('');
+  const [worldIdVerified, setWorldIdVerified] = useState(agent.worldIdVerified);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const agentRef = useRef(agent);
   agentRef.current = agent;
-
-  const [worldIdVerified, setWorldIdVerified] = useState(agent.worldIdVerified);
 
   useEffect(() => {
     setWorldIdVerified(agent.worldIdVerified);
   }, [agent.worldIdVerified]);
 
-  // Check if agent already has a session key
   useEffect(() => {
-    setSessionKeyReady(!!getStoredSessionKey(agent.id));
+    const sessionData = getStoredSessionKey(agent.id);
+    if (sessionData) {
+      setSessionKeyReady(true);
+      setSessionAddress(sessionData.publicKeyBase64);
+      // Fetch balance
+      fetchSessionBalance(sessionData.publicKeyBase64);
+    } else {
+      setSessionKeyReady(false);
+      setSessionBalance(null);
+      setSessionAddress('');
+    }
   }, [agent.id]);
 
-  const handleWorldIDVerify = () => {
-    setShowWorldIDModal(true);
+  const fetchSessionBalance = async (publicKeyBase64: string) => {
+    try {
+      const pubkeyBytes = Buffer.from(publicKeyBase64, 'base64');
+      const { PublicKey } = await import('@solana/web3.js');
+      const pubkey = new PublicKey(pubkeyBytes);
+      const conn = new Connection(
+        process.env.NEXT_PUBLIC_SOLANA_RPC || 'https://api.devnet.solana.com',
+        'confirmed'
+      );
+      const balance = await conn.getBalance(pubkey);
+      setSessionBalance(balance / 1e9);
+    } catch {
+      setSessionBalance(null);
+    }
+  };
+
+  const handleWorldIDVerify = async () => {
+    try {
+      const rpSig = await fetch('/api/rp-signature', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'verify-human' }),
+      }).then(r => r.json());
+
+      const context: RpContext = {
+        rp_id: process.env.NEXT_PUBLIC_WLD_RP_ID!,
+        nonce: rpSig.nonce,
+        created_at: rpSig.created_at,
+        expires_at: rpSig.expires_at,
+        signature: rpSig.sig,
+      };
+      setRpContext(context);
+      setWorldIdOpen(true);
+    } catch (e) {
+      addLog(agent.id, {
+        id: `log_${Date.now()}`,
+        timestamp: Date.now(),
+        action: 'world_id',
+        result: 'error',
+        message: `World ID verification failed: ${e}`,
+      });
+    }
   };
 
   const handleWorldIDSuccess = () => {
     setWorldIdVerified(true);
     updateAgentVerified(agent.id, true);
-    setShowWorldIDModal(false);
+    setWorldIdOpen(false);
   };
 
   const setupSessionKey = async () => {
@@ -188,11 +242,12 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
 
     setFundingSession(true);
     try {
-      // Generate fresh ephemeral keypair
       const sessionKP = Keypair.generate();
 
-      // Fund it from user wallet (one Phantom popup)
+      const { blockhash } = await connection.getLatestBlockhash();
       const fundTx = new (await import('@solana/web3.js')).Transaction();
+      fundTx.recentBlockhash = blockhash;
+      fundTx.feePayer = publicKey;
       fundTx.add(
         (await import('@solana/web3.js')).SystemProgram.transfer({
           fromPubkey: publicKey,
@@ -200,28 +255,39 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
           lamports: Math.floor(0.05 * (await import('@solana/web3.js')).LAMPORTS_PER_SOL),
         })
       );
-      const { blockhash } = await connection.getLatestBlockhash();
-      fundTx.recentBlockhash = blockhash;
-      fundTx.feePayer = publicKey;
 
       const funded = await signTransaction(fundTx);
       const fundSig = await connection.sendRawTransaction(funded.serialize());
       await connection.confirmTransaction(fundSig);
 
-      // Store base64-encoded private key (persisted to localStorage)
+      const pubKeyBase64 = Buffer.from(sessionKP.publicKey.toBytes()).toString('base64');
+      const privKeyBase64 = Buffer.from(sessionKP.secretKey).toString('base64');
+
       setSessionKey(agent.id, {
-        privateKeyBase64: Buffer.from(sessionKP.secretKey).toString('base64'),
-        publicKeyBase64: Buffer.from(sessionKP.publicKey.toBytes()).toString('base64'),
+        privateKeyBase64: privKeyBase64,
+        publicKeyBase64: pubKeyBase64,
         agentId: agent.id,
         fundedAt: Date.now(),
       });
+
+      setSessionAddress(sessionKP.publicKey.toString());
+      setSessionBalance(0.05);
+
+      // Register agent in World ID AgentBook using session key
+      try {
+        await registerAgentInAgentBook(sessionKP.publicKey.toString());
+        setWorldIdVerified(true);
+        updateAgentVerified(agent.id, true);
+      } catch (e) {
+        console.warn('World ID registration skipped:', e);
+      }
 
       addLog(agent.id, {
         id: `log_${Date.now()}`,
         timestamp: Date.now(),
         action: 'session_key',
         result: 'success',
-        message: `✓ Session key funded at ${sessionKP.publicKey.toString().slice(0, 8)}... | tx: ${fundSig.slice(0, 8)}...`,
+        message: `✓ Swig Session Wallet funded at ${sessionKP.publicKey.toString().slice(0, 8)}... | tx: ${fundSig.slice(0, 8)}...`,
       });
 
       setSessionKeyReady(true);
@@ -252,7 +318,6 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
 
     setIsExecuting(true);
     try {
-      // ── Session key path: silent, no popup ──────────────────────────
       const sessionKeyData = getStoredSessionKey(agentRef.current.id);
 
       if (sessionKeyData) {
@@ -265,7 +330,6 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         return log.result === 'success';
       }
 
-      // ── Manual wallet path ─────────────────────────────────────────
       if (signTransaction && publicKey) {
         const log = await executeAgentTask(agentRef.current, signTransaction, publicKey, connection);
         addLog(agentRef.current.id, log);
@@ -275,7 +339,6 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         return log.result === 'success';
       }
 
-      // ── No wallet connected: simulated ─────────────────────────────
       addLog(agentRef.current.id, {
         id: `log_${Date.now()}`,
         timestamp: Date.now(),
@@ -349,11 +412,30 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-      {showWorldIDModal && (
-        <WorldIDModal
-          agentId={agent.id}
-          onSuccess={handleWorldIDSuccess}
-          onClose={() => setShowWorldIDModal(false)}
+      {!worldIdVerified && (
+        <IDKitRequestWidget
+          open={worldIdOpen}
+          onOpenChange={setWorldIdOpen}
+          app_id={(process.env.NEXT_PUBLIC_WLD_APP_ID || 'app_staging_test') as `app_${string}`}
+          action="verify-human"
+          rp_context={rpContext!}
+          allow_legacy_proofs={true}
+          preset={orbLegacy({ signal: agent.walletAddress || agent.id })}
+          environment="staging"
+          handleVerify={async (result: IDKitResult) => {
+            const response = await fetch('/api/verify-proof', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                rp_id: process.env.NEXT_PUBLIC_WLD_RP_ID,
+                idkitResponse: result,
+              }),
+            });
+            if (!response.ok) throw new Error('Verification failed');
+          }}
+          onSuccess={() => {
+            handleWorldIDSuccess();
+          }}
         />
       )}
 
@@ -361,6 +443,12 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         <div>
           <h2 style={{ fontSize: '1.6rem', fontWeight: 700 }}>{agent.name}</h2>
           <p style={{ color: 'var(--text-secondary)', marginTop: '0.25rem' }}>{agent.description}</p>
+          {agent.nftMint && (
+            <a href={explorerUrl(agent.nftMint)} target="_blank" rel="noopener noreferrer"
+              style={{ color: '#9945FF', fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: '0.3rem', marginTop: '0.3rem' }}>
+              <Globe size={12} /> View on-chain agent record ↗
+            </a>
+          )}
         </div>
         <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
           {autoRunning ? (
@@ -375,8 +463,7 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
             <button onClick={handleAutoToggle} style={{
               display: 'flex', alignItems: 'center', gap: '0.5rem',
               background: 'rgba(20,241,149,0.15)', border: '1px solid rgba(20,241,149,0.4)',
-              borderRadius: '8px', padding: '0.5rem 1rem', color: '#14F195',
-              cursor: 'pointer'
+              borderRadius: '8px', padding: '0.5rem 1rem', color: '#14F195', cursor: 'pointer'
             }}>
               <Play size={16} /> Auto Run
             </button>
@@ -399,14 +486,63 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: '1rem' }}>
+      {/* ── Swig Session Wallet Section (prominent) ──────────────────── */}
+      <div className="card" style={{
+        border: sessionKeyReady ? '1px solid rgba(20,241,149,0.4)' : '1px solid rgba(245,158,11,0.3)',
+        background: sessionKeyReady ? 'rgba(20,241,149,0.05)' : 'rgba(245,158,11,0.05)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1rem' }}>
+          <Key size={18} color={sessionKeyReady ? '#14F195' : '#f59e0b'} />
+          <span style={{ fontWeight: 600, fontSize: '1rem' }}>Powered by Swig — Session Wallet</span>
+          <span style={{
+            fontSize: '0.7rem', padding: '0.15rem 0.5rem', borderRadius: '4px',
+            background: sessionKeyReady ? 'rgba(20,241,149,0.2)' : 'rgba(245,158,11,0.2)',
+            color: sessionKeyReady ? '#14F195' : '#f59e0b'
+          }}>
+            {sessionKeyReady ? '● ACTIVE — Auto-execution enabled' : '○ NOT SET UP'}
+          </span>
+        </div>
+
+        {sessionKeyReady ? (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: '8px', padding: '0.75rem' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Session Wallet Address</div>
+              <div style={{ fontSize: '0.85rem', color: '#14F195', fontFamily: 'monospace' }}>
+                {shortenAddress(sessionAddress || '')}
+              </div>
+            </div>
+            <div style={{ background: 'var(--bg-secondary)', borderRadius: '8px', padding: '0.75rem' }}>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>SOL Balance</div>
+              <div style={{ fontSize: '0.85rem', color: '#14F195' }}>
+                {sessionBalance !== null ? `${sessionBalance.toFixed(4)} SOL` : 'Loading...'}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', flex: 1 }}>
+              Set up a Swig session wallet to enable silent auto-execution. Agent signs all transactions without Phantom popups.
+            </p>
+            <button onClick={setupSessionKey} disabled={fundingSession} style={{
+              background: 'linear-gradient(135deg, #14F195, #0fa)',
+              border: 'none', borderRadius: '8px', padding: '0.6rem 1.2rem',
+              color: '#000', fontWeight: 600, cursor: fundingSession ? 'wait' : 'pointer',
+              opacity: fundingSession ? 0.7 : 1, display: 'flex', alignItems: 'center', gap: '0.5rem'
+            }}>
+              <Key size={16} />
+              {fundingSession ? 'Setting up...' : 'Setup Session Wallet'}
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: '1rem' }}>
         {[
           { label: 'Status', value: agent.status.toUpperCase(), color: agent.status === 'running' ? '#14F195' : '#a0a0b0' },
           { label: 'Budget', value: `$${agent.budget}`, color: '#9945FF' },
           { label: 'Spent', value: `$${agent.spent.toFixed(2)}`, color: '#f59e0b' },
           { label: 'Tasks Run', value: agent.tasks.reduce((s, t) => s + t.executedCount, 0).toString(), color: '#14F195' },
           { label: 'World ID', value: worldIdVerified ? 'VERIFIED' : 'PENDING', color: worldIdVerified ? '#14F195' : '#a0a0b0' },
-          { label: 'Session Key', value: sessionKeyReady ? 'ACTIVE' : 'NONE', color: sessionKeyReady ? '#14F195' : '#a0a0b0' },
         ].map(s => (
           <div key={s.label} className="card" style={{ textAlign: 'center' }}>
             <div style={{ fontSize: '1.4rem', fontWeight: 700, color: s.color }}>{s.value}</div>
@@ -414,21 +550,6 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
           </div>
         ))}
       </div>
-
-      {!sessionKeyReady && signTransaction && publicKey && (
-        <button onClick={setupSessionKey} disabled={fundingSession} style={{
-          display: 'flex', alignItems: 'center', gap: '0.75rem',
-          background: 'rgba(20,241,149,0.1)', border: '1px solid rgba(20,241,149,0.3)',
-          borderRadius: '10px', padding: '0.75rem 1rem', color: '#14F195', cursor: fundingSession ? 'wait' : 'pointer', width: '100%',
-          textAlign: 'left', opacity: fundingSession ? 0.7 : 1
-        }}>
-          <Zap size={18} />
-          <div>
-            <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>{fundingSession ? 'Setting up session key...' : 'Setup Session Key (one Phantom approval)'}</div>
-            <div style={{ fontSize: '0.8rem', opacity: 0.7 }}>Enable silent auto-execution — no Phantom popup on every run</div>
-          </div>
-        </button>
-      )}
 
       {autoRunning && (
         <div style={{
@@ -438,7 +559,7 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
           <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#14F195', animation: 'pulse 1.5s infinite' }} />
           <span style={{ fontSize: '0.9rem', color: '#14F195' }}>
             Auto-run active — checking every 30 seconds
-            {sessionKeyReady ? ' (session key — silent)' : signTransaction ? ' (Phantom — requires approval)' : ' (simulated mode)'}
+            {sessionKeyReady ? ' (Swig session wallet — silent)' : signTransaction ? ' (Phantom — requires approval)' : ' (simulated mode)'}
           </span>
         </div>
       )}
@@ -452,8 +573,8 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         }}>
           <Shield size={20} />
           <div>
-            <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>Verify with World ID</div>
-            <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Prove you're human to activate the agent</div>
+            <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>Verify with World ID AgentKit</div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Register agent in World ID AgentBook — proves human ownership</div>
           </div>
         </button>
       ) : (
@@ -464,8 +585,8 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
         }}>
           <CheckCircle size={20} />
           <div>
-            <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>World ID Verified</div>
-            <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>This agent is human-verified and ready to operate</div>
+            <div style={{ fontWeight: 600, fontSize: '0.95rem' }}>World ID AgentKit Verified</div>
+            <div style={{ fontSize: '0.8rem', opacity: 0.8 }}>Agent registered in World ID AgentBook — backed by verified human</div>
           </div>
         </div>
       )}
@@ -480,7 +601,7 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
               <span style={{ fontWeight: 500 }}>{task.description}</span>
               <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>×{task.executedCount}</span>
             </div>
-            {task.amount && <div style={{ fontSize: '0.8rem', color: '#14F195', marginTop: '0.25rem' }}>${task.amount} per execution</div>}
+            {task.amount && <div style={{ fontSize: '0.8rem', color: '#14F195', marginTop: '0.25rem' }}>${task.amount} USDC per execution</div>}
           </div>
         ))}
       </div>
@@ -507,83 +628,6 @@ function AgentDetail({ agent, publicKey }: { agent: Agent; publicKey: any }) {
               </div>
             </div>
           ))
-        )}
-      </div>
-    </div>
-  );
-}
-
-function WorldIDModal({ agentId, onSuccess, onClose }: { agentId: string; onSuccess: () => void; onClose: () => void }) {
-  const [verifying, setVerifying] = useState(false);
-  const [step, setStep] = useState<'intro' | 'scanning'>('intro');
-
-  const handleVerify = async () => {
-    setVerifying(true);
-    setStep('scanning');
-    await new Promise(r => setTimeout(r, 2000));
-    setVerifying(false);
-    onSuccess();
-  };
-
-  return (
-    <div style={{
-      position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.8)', zIndex: 200,
-      display: 'flex', alignItems: 'center', justifyContent: 'center'
-    }} onClick={onClose}>
-      <div style={{
-        background: 'var(--bg-card)', border: '1px solid rgba(245,158,11,0.4)',
-        borderRadius: '16px', padding: '2rem', maxWidth: '400px', width: '100%',
-        display: 'flex', flexDirection: 'column', gap: '1.5rem', position: 'relative'
-      }} onClick={e => e.stopPropagation()}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <Shield size={20} color="#f59e0b" />
-            <span style={{ fontWeight: 600 }}>World ID Verification</span>
-          </div>
-          <button onClick={onClose} style={{ background: 'none', border: 'none', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '1.5rem' }}>×</button>
-        </div>
-
-        {step === 'intro' && (
-          <>
-            <div style={{ textAlign: 'center' }}>
-              <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: 'rgba(245,158,11,0.1)', border: '2px solid rgba(245,158,11,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1rem' }}>
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
-                  <circle cx="12" cy="8" r="4" fill="#f59e0b" />
-                  <path d="M12 14c-4 0-8 2-8 4.5V21h16v-2.5C20 16 16 14 12 14z" fill="#f59e0b" />
-                </svg>
-              </div>
-              <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', lineHeight: 1.6 }}>
-                Prove you are a unique human to protect this agent from bots and sybil attacks.
-                Your privacy is preserved — Worldcoin never shares your biometric data.
-              </p>
-            </div>
-            <button onClick={handleVerify} style={{
-              background: 'linear-gradient(135deg, #f59e0b, #d97706)',
-              border: 'none', borderRadius: '10px', padding: '0.75rem', color: 'white',
-              fontWeight: 600, cursor: 'pointer', fontSize: '1rem'
-            }}>
-              Begin Verification
-            </button>
-            <p style={{ textAlign: 'center', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-              Requires World App with a World ID registered
-            </p>
-          </>
-        )}
-
-        {step === 'scanning' && (
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ width: '80px', height: '80px', borderRadius: '50%', border: '3px solid rgba(245,158,11,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1rem', position: 'relative' }}>
-              <div style={{ width: '60px', height: '60px', borderRadius: '50%', background: 'rgba(245,158,11,0.15)', display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'pulse 1.5s infinite' }}>
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none">
-                  <circle cx="12" cy="8" r="4" fill="#f59e0b" />
-                  <path d="M12 14c-4 0-8 2-8 4.5V21h16v-2.5C20 16 16 14 12 14z" fill="#f59e0b" />
-                </svg>
-              </div>
-              <div style={{ position: 'absolute', inset: '-3px', borderRadius: '50%', border: '3px solid transparent', borderTopColor: '#f59e0b', animation: 'spin 1s linear infinite' }} />
-            </div>
-            <p style={{ fontWeight: 600, fontSize: '1rem' }}>Scanning your face...</p>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginTop: '0.5rem' }}>Position your face in the frame</p>
-          </div>
         )}
       </div>
     </div>
@@ -628,14 +672,16 @@ function CreateAgentForm({ onClose, walletAddress }: { onClose: () => void; wall
     };
     addAgent(agent);
 
-    if (wallet) {
+    if (signTransaction && publicKey) {
       try {
-        const nftMint = await mintAgentNFT(wallet, agent.id, agent.name);
-        const { updateAgentNFT } = useAgentStore.getState();
-        updateAgentNFT(agent.id, nftMint);
-        agent.nftMint = nftMint;
+        const nftMint = await mintAgentNFT(form.name, agent.id, publicKey, signTransaction);
+        if (nftMint) {
+          const { updateAgentNFT } = useAgentStore.getState();
+          updateAgentNFT(agent.id, nftMint);
+          agent.nftMint = nftMint;
+        }
       } catch (e) {
-        console.warn('NFT minting failed, continuing without NFT:', e);
+        console.warn('On-chain registration skipped:', e);
       }
     }
 
@@ -688,7 +734,7 @@ function CreateAgentForm({ onClose, walletAddress }: { onClose: () => void; wall
             <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 500 }}>Task Type</label>
             <select value={form.taskType} onChange={e => setForm({ ...form, taskType: e.target.value as any })}
               style={{ width: '100%', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '0.75rem', color: 'white', fontSize: '1rem', outline: 'none' }}>
-              <option value="send_payment">Send Payment</option>
+              <option value="send_payment">Send USDC Payment</option>
               <option value="dca">DCA (Dollar Cost Average)</option>
               <option value="schedule">Scheduled Task</option>
               <option value="custom">Custom</option>
@@ -701,7 +747,7 @@ function CreateAgentForm({ onClose, walletAddress }: { onClose: () => void; wall
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
             <div>
-              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 500 }}>Amount per run ($)</label>
+              <label style={{ display: 'block', marginBottom: '0.5rem', fontWeight: 500 }}>Amount per run (USDC)</label>
               <input type="number" value={form.amount} onChange={e => setForm({ ...form, amount: Number(e.target.value) })}
                 style={{ width: '100%', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: '8px', padding: '0.75rem', color: 'white', fontSize: '1rem', outline: 'none' }} />
             </div>
@@ -745,7 +791,7 @@ function CreateAgentForm({ onClose, walletAddress }: { onClose: () => void; wall
               <span style={{ color: 'var(--text-secondary)' }}>Task: </span><strong>{form.taskType}</strong>
             </div>
             <div style={{ background: 'var(--bg-secondary)', borderRadius: '8px', padding: '0.75rem' }}>
-              <span style={{ color: 'var(--text-secondary)' }}>Per run: </span><strong>${form.amount}</strong>
+              <span style={{ color: 'var(--text-secondary)' }}>Per run: </span><strong>${form.amount} USDC</strong>
             </div>
           </div>
           <div style={{ display: 'flex', gap: '1rem' }}>
@@ -753,7 +799,7 @@ function CreateAgentForm({ onClose, walletAddress }: { onClose: () => void; wall
               Back
             </button>
             <button className="btn-primary" onClick={handleDeploy} style={{ flex: 2, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', fontSize: '1rem' }}>
-              🚀 Deploy Agent + Mint NFT
+              🚀 Deploy Agent (Metaplex Registered)
             </button>
           </div>
         </div>
