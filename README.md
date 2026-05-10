@@ -6,11 +6,9 @@ Built for **Solana Frontier Hackathon 2026** | Deadline: May 10, 2026
 
 ---
 ## 🔗 Quick Links
-Live Demo: agentpay-eta.vercel.app
-
-Video Walkthrough: Watch on YouTube
-
-GitHub: github.com/muhamedag2022/agentpay
+* **Live Demo:** [agentpay-eta.vercel.app](https://agentpay-eta.vercel.app)
+* **Video Walkthrough:** [Watch on YouTube](https://youtu.be/RCl9f3fYpXY)
+* **GitHub:** [github.com/muhamedag2022/agentpay](https://github.com/muhamedag2022/agentpay)
 ---
 
 ## Features
